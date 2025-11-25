@@ -1,0 +1,19 @@
+# 가상환경
+.venv/
+
+# 파이참 설정
+.idea/
+
+# 파이썬 캐시
+__pycache__/
+*.pyc
+
+# 실행 중 생성되는 출력물
+app/outputs/
+app/saved/cam_result/
+app/temp_image/
+app/temp_mask/
+
+# 아주 큰 모델 파일이라 Git LFS 안 쓰면 100MB 제한 있음, 얘는 따로 다운로드
+app/models/*.pth
+app/models/RCNN/*.pth
