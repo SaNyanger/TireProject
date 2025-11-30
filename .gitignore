@@ -14,6 +14,6 @@ app/saved/cam_result/
 app/temp_image/
 app/temp_mask/
 
-# 아주 큰 모델 파일이라 Git LFS 안 쓰면 100MB 제한 있음, 얘는 따로 다운로드
-app/models/*.pth
-app/models/RCNN/*.pth
+# LFS 사용함
+#app/models/*.pth
+#app/models/RCNN/*.pth
