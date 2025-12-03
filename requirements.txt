@@ -1,0 +1,8 @@
+# 개발했던 환경
+
+opencv-python==4.12.0.88
+numpy==2.2.6
+torch==2.9.1
+torchvision==0.24.1
+treadscan==1.0.5
+pandas==2.3.3

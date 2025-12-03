@@ -11,7 +11,8 @@ from tire_classifier import classify_tread_image
 # =========================
 IMG_NAME = "car1.jpg"      # 기본 입력 이미지 이름 (assets 폴더 기준)
 
-MAX_SIDE = None            # 긴 변 리사이즈 상한(None이면 원본 유지)
+MAX_SIDE = 1920            # 긴 변 리사이즈 상한 이보다 크면 축소 (None이면 원본 유지)
+MIN_SIDE = 800             # 긴 변 리사이즈 하한 이보다 작으면 확대 (None이면 원본 유지)
 CROP_PAD = 1.75            # 후보 박스 여유 배수
 UPSCALE_BEFORE_UNWRAP = 1.8  # RCNN/언랩 전 업스케일 배수(1.6~2.0 권장)
 STD_EXPORT_WIDTH = 256     # 언랩 결과의 표준 폭(후처리 리사이즈)
@@ -55,6 +56,37 @@ def nms(boxes, scores, thr=0.4): # boxes: 후보 박스 리스트, scores: 각 �
                 remain.append(j) # 서로 다른 물체일 가능성이 충분히 있다라고 보고 살려둔다. 그 외에는 겹친다고 판단하고 버림.
         idxs = np.array(remain) # 이제 다음 while 턴에는 remain만 후보로 다시 돌아감. 이 과정을 후보가 다 떨어질 때까지 반복.
     return [boxes[i] for i in keep], [scores[i] for i in keep] # keep에 들어있는 인덱스로 boxes, scores를 다시 구성해서 리턴.
+
+
+def is_tread_only_image(gray):
+    """
+    트레드만 찍은 사진인지 판별
+    - 타원/원이 검출되지 않으면 트레드만 있는 사진으로 간주
+    """
+    # 타원 검출 시도
+    ellipse_found = False  # 타원 검출 여부 플래그 초기화
+    try:
+        import treadscan  # treadscan 라이브러리 임포트
+        seg = treadscan.Segmentor(gray)  # 그레이스케일 이미지로 Segmentor 객체 생성
+        ell = seg.find_ellipse(threshold=135, min_area=0)  # 타원 검출 시도
+        if ell is not None:  # 타원이 검출되었으면
+            ellipse_found = True  # 플래그를 True로 설정
+    except:
+        pass  # treadscan 임포트 실패 또는 검출 오류 시 무시
+
+    # 허프 서클 검출 시도
+    circle_found = False  # 원 검출 여부 플래그 초기화
+    g = cv2.GaussianBlur(gray, (5, 5), 0)  # 노이즈 제거를 위한 가우시안 블러 적용
+    h, w = gray.shape  # 이미지 높이, 너비 추출
+    circles = cv2.HoughCircles(  # 허프 변환으로 원 검출
+        g, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min(h, w) // 4,  # 기본 파라미터 설정
+        param1=120, param2=40, minRadius=40, maxRadius=0  # 검출 민감도 및 반지름 범위
+    )
+    if circles is not None:  # 원이 검출되었으면
+        circle_found = True  # 플래그를 True로 설정
+
+    # 둘 다 없으면 트레드만 있는 사진으로 판단
+    return (not ellipse_found) and (not circle_found)  # 타원도 원도 없으면 True 반환
 
 # =========================
 # 후보 ROI 탐색 (타원 + 허프서클 → NMS)
@@ -335,21 +367,68 @@ def analyze_car_image(car_image_path: str) -> dict:
     out_dir = os.path.join(script_dir, "outputs")
     os.makedirs(out_dir, exist_ok=True) # outputs 폴더가 없다면 생성. exist_ok=True 때문에 이미 있어도 에러 없이 그냥 넘어감.
 
-    # 1) 차량 이미지 로드, 조명 보정
+    # 0) 차량 이미지 로드, 조명 보정
     img = cv2.imread(car_image_path, cv2.IMREAD_GRAYSCALE) # 입력 이미지를 그레이스케일로 읽는다. 전체적으로 타이어 위치 찾기 / 엣지 / 명암 대비에 집중할 거라 1채널 처리로 단순화.
     if img is None:  # 경로가 잘못됐거나 파일이 손상된 경우 None.
         raise FileNotFoundError(f"Image not found: {car_image_path}") # 이때는 FileNotFoundError를 던져서 명확히 에러를 띄움. 이 예외는 아래의 try/except에서 다시 잡아서 JSON으로 정리된 실패 응답을 내보내게 됨.
 
     print(f"[INFO] input car image: {car_image_path} shape={img.shape[::-1]}") # img.shape[::-1] : (height, width) 형태인 shape를 뒤집어서 (width, height)로 출력하는 편의 표현.
 
-    h, w = img.shape # 이미지 크기 확인.
-    if (MAX_SIDE is not None) and (max(h, w) > MAX_SIDE): # 전역 파라미터 MAX_SIDE가 설정되어 있고, 이미지의 긴 변이 그 값보다 클 경우에만 리사이즈. 너무 큰 이미지는 처리 시간이 길어지니, 긴 변 기준으로 줄이는 옵션.
-        s = MAX_SIDE / max(h, w) # 축소 비율.
-        img = cv2.resize(img, (int(w * s), int(h * s)), interpolation=cv2.INTER_AREA) # 줄일 때는 샘플링 특성상 INTER_AREA가 좋다고 판단함.
-        print(f"[INFO] resized image -> {img.shape[::-1]}")
+    # ===== 이미지 크기 정규화 =====
+    h, w = img.shape  # 이미지의 높이(h)와 너비(w) 추출
+    max_dim = max(h, w)  # 긴 변의 길이 계산
+
+    # 이미지가 너무 크면 축소 (처리 속도 향상)
+    if max_dim > MAX_SIDE:  # 긴 변이 MAX_SIDE(1920px)보다 크면
+        s = MAX_SIDE / max_dim  # 축소 비율 계산 (예: 3840 → 1920이면 s=0.5)
+        img = cv2.resize(  # 이미지 리사이즈 수행
+            img,  # 원본 이미지
+            (int(w * s), int(h * s)),  # 새로운 크기 (너비, 높이)
+            interpolation=cv2.INTER_AREA  # 축소 시 INTER_AREA가 계단 현상 방지에 좋음
+        )
+        print(f"[INFO] 이미지 축소: {max_dim}px → {MAX_SIDE}px")  # 로그 출력
+
+    # 이미지가 너무 작으면 확대 (검출 정확도 향상)
+    elif max_dim < MIN_SIDE:  # 긴 변이 MIN_SIDE(800px)보다 작으면
+        s = MIN_SIDE / max_dim  # 확대 비율 계산 (예: 400 → 800이면 s=2.0)
+        img = cv2.resize(  # 이미지 리사이즈 수행
+            img,  # 원본 이미지
+            (int(w * s), int(h * s)),  # 새로운 크기 (너비, 높이)
+            interpolation=cv2.INTER_CUBIC  # 확대 시 INTER_CUBIC이 부드러운 결과 제공
+        )
+        print(f"[INFO] 이미지 확대: {max_dim}px → {MIN_SIDE}px")  # 로그 출력
+
+    # MIN_SIDE <= max_dim <= MAX_SIDE인 경우 리사이즈 없이 원본 유지
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)) # CLAHE 객체 생성. 일반적으로 쓰는 튜닝 값인 2.0 과 (8,8) 넣음.
     img_n = clahe.apply(img) # CLAHE 적용된 정규화 이미지. 이후 모든 후보 탐색/RCNN 언랩은 이 img_n 기준으로 진행된다.
+
+    # 1) 트레드 사진 판단, 맞으면 트레드 마모도 분석 모델로 전송
+    if is_tread_only_image(img_n):  # 타원/원이 없는 트레드만 있는 이미지인지 확인
+        print("[INFO] 트레드만 있는 이미지로 판단, 바로 분류 모델로 전송")  # 로그 출력
+
+        # 트레드 이미지 저장
+        tread_path = os.path.join(out_dir, "tread_direct.png")  # 저장 경로 설정
+        cv2.imwrite(tread_path, img_n)  # CLAHE 적용된 이미지 저장
+
+        # 바로 분류 모델 호출 (언랩 과정 생략)
+        status, prob, cam_path = classify_tread_image(  # 팀원의 분류 모델 호출
+            tread_path,  # 트레드 이미지 경로
+            model_path=os.path.join(script_dir, "models"),  # 모델 폴더 경로
+            model_name="model_best_weights.pth",  # 모델 가중치 파일명
+            img_size=224,  # 입력 이미지 크기
+            result_path=os.path.join(script_dir, "saved", "cam_result"),  # CAM 결과 저장 경로
+            temp_image_dir=os.path.join(script_dir, "temp_image"),  # 임시 이미지 폴더
+            temp_mask_dir=os.path.join(script_dir, "temp_mask"),  # 임시 마스크 폴더
+        )
+
+        # JSON 형태로 결과 반환
+        return {
+            "result": {
+                "predict_result": status,  # 분류 결과 (danger/warning/safety)
+                "img_url": cam_path  # CAM 히트맵 이미지 경로
+            }
+        }
 
     try:
         # 2) 타이어 후보 탐색
