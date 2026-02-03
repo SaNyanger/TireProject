@@ -9,7 +9,7 @@ from tire_classifier import classify_tread_image
 # =========================
 # 튜닝 파라미터 (숫자만 바꿔도 됨)
 # =========================
-IMG_NAME = "car1.jpg"      # 기본 입력 이미지 이름 (assets 폴더 기준)
+IMG_NAME = "car6_withSnow.webp"      # 기본 입력 이미지 이름 (assets 폴더 기준)
 
 MAX_SIDE = 1920            # 긴 변 리사이즈 상한 이보다 크면 축소 (None이면 원본 유지)
 MIN_SIDE = 800             # 긴 변 리사이즈 하한 이보다 작으면 확대 (None이면 원본 유지)
@@ -58,48 +58,92 @@ def nms(boxes, scores, thr=0.4): # boxes: 후보 박스 리스트, scores: 각 �
     return [boxes[i] for i in keep], [scores[i] for i in keep] # keep에 들어있는 인덱스로 boxes, scores를 다시 구성해서 리턴.
 
 
-def is_tread_only_image(gray):
+def is_tread_only_image(img, debug=False, return_circle=False):
     """
-    트레드만 찍은 사진인지 판별
-    - 타원/원이 검출되지 않으면 트레드만 있는 사진으로 간주
+    트레드 only 이미지인지 판별.
+    return_circle=True면 (is_tread, best_circle_original_coords)를 반환.
+    best_circle_original_coords = (cx, cy, r) in ORIGINAL image coordinates or None
     """
-    # 타원 검출 시도
-    ellipse_found = False  # 타원 검출 여부 플래그 초기화
-    try:
-        import treadscan  # treadscan 라이브러리 임포트
-        seg = treadscan.Segmentor(gray)  # 그레이스케일 이미지로 Segmentor 객체 생성
-        ell = seg.find_ellipse(threshold=135, min_area=0)  # 타원 검출 시도
-        if ell is not None:  # 타원이 검출되었으면
-            ellipse_found = True  # 플래그를 True로 설정
-    except:
-        pass  # treadscan 임포트 실패 또는 검출 오류 시 무시
+    import cv2
+    import numpy as np
 
-    # 허프 서클 검출 시도
-    circle_found = False  # 원 검출 여부 플래그 초기화
-    g = cv2.GaussianBlur(gray, (5, 5), 0)  # 노이즈 제거를 위한 가우시안 블러 적용
-    h, w = gray.shape  # 이미지 높이, 너비 추출
-    circles = cv2.HoughCircles(  # 허프 변환으로 원 검출
-        g, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min(h, w) // 4,  # 기본 파라미터 설정
-        param1=120, param2=40, minRadius=40, maxRadius=0  # 검출 민감도 및 반지름 범위
+    # 0) gray 만들기
+    if img.ndim == 3:
+        gray0 = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    else:
+        gray0 = img
+
+    # 1) 게이트용 다운스케일 (속도용)
+    H0, W0 = gray0.shape
+    target_w = 360
+    if W0 > target_w:
+        scale = target_w / float(W0)  # small = original * scale
+        small = cv2.resize(gray0, (target_w, max(1, int(H0 * scale))), interpolation=cv2.INTER_AREA)
+    else:
+        scale = 1.0
+        small = gray0
+
+    h, w = small.shape
+    m = min(h, w)
+
+    # 2) 허프(게이트) - 큰 원이 있으면 wheel_like로 간주
+    g = cv2.GaussianBlur(small, (5, 5), 0)
+
+    # 반지름 범위 제한 (maxRadius=0 금지)
+    minR = max(12, int(m * 0.18))
+    maxR = max(minR + 5, int(m * 0.60))
+
+    circles = cv2.HoughCircles(
+        g, cv2.HOUGH_GRADIENT,
+        dp=1.2,
+        minDist=m // 3,
+        param1=120, param2=45,
+        minRadius=minR, maxRadius=maxR
     )
-    if circles is not None:  # 원이 검출되었으면
-        circle_found = True  # 플래그를 True로 설정
 
-    # 둘 다 없으면 트레드만 있는 사진으로 판단
-    return (not ellipse_found) and (not circle_found)  # 타원도 원도 없으면 True 반환
+    circle_found = circles is not None and circles.shape[1] > 0
+
+    best_circle_orig = None
+    if circle_found:
+        # 가장 큰 r을 best로 선택
+        cs = circles[0]  # (N,3)
+        best = cs[np.argmax(cs[:, 2])]
+        cx_s, cy_s, r_s = float(best[0]), float(best[1]), float(best[2])
+
+        # 원본 좌표로 환산
+        if scale != 1.0:
+            cx0 = cx_s / scale
+            cy0 = cy_s / scale
+            r0  = r_s  / scale
+        else:
+            cx0, cy0, r0 = cx_s, cy_s, r_s
+
+        best_circle_orig = (cx0, cy0, r0)
+
+    # 3) 트레드 only 판정 로직 (너가 원하는 방향에 맞춰 "보수적")
+    #    - wheel_like(큰 원이 잡히면) => tread-only 아님(False)
+    is_tread = (not circle_found)
+
+    if debug:
+        print(f"[TREAD_GATE] circle_found={circle_found} -> is_tread={is_tread}")
+
+    if return_circle:
+        return is_tread, best_circle_orig
+    return is_tread
+
 
 # =========================
 # 후보 ROI 탐색 (타원 + 허프서클 → NMS)
 # =========================
 
-# find_candidates(gray) 함수
+# find_candidates(gray, gate_circle=None) 함수
 # 입력은 CLAHE까지 적용된 그레이스케일 이미지(나중에 analyze_car_image에서 넘김).
 # 최종적으로 타이어가 있을 법한 박스 후보들을 찾는 함수.
 # CLAHE 등으로 전처리된 흑백 차량 이미지에서 타이어/휠이 있을 법한 후보 박스(ROI)들을 찾아서 boxes(좌표 리스트)와 scores(간단 점수 리스트)로 돌려주는 함수.
 # 이 boxes가 바로 다음 단계 run_rcnn_on_crops(...)로 넘어가서 각 후보에 대해 RCNN 언랩을 시도하게 됨.
 # 점수를 주는 기준은 A. 얼마나 원에 가까우냐, B. 얼마나 엣지가 많이 검출되냐(타이어 부분일수록 트레드 패턴때문에 경계면이 많이 나타나니까) C.  가장 가능성 낮으니까 점수 가장 낮게 줌
 
-def find_candidates(gray):
+def find_candidates(gray, gate_circle=None):
     """
     입력: gray (uint8, 단일 채널)
     반환: (boxes, scores)
@@ -107,6 +151,7 @@ def find_candidates(gray):
       - scores: 각 후보의 간단 점수(크게 의미두진 않아도 됨)
     """
     h, w = gray.shape # h: 이미지 높이(height), w: 이미지 너비(width) , 이후 박스 좌표를 이미지 범위 안으로 자를 때(0~w, 0~h) 쓰려고 바로 꺼내둔 것.
+    m = min(h, w)
     boxes, scores = [], [] # boxes: ROI 후보들을 담는 리스트, scores: 각 박스에 대한 점수(이 후보가 타이어일 가능성 점수)를 담는 리스트. 두 리스트는 같은 인덱스끼리 짝이 됨.
 
     # A) treadscan의 타원 검출 (휠 전체가 잘 보이는 경우에 강함), 왜 타원을 찾나? 자동차 휠(림)을 측면에서 보면 거의 타원 모양이라 이걸 찾으려 함.
@@ -128,22 +173,48 @@ def find_candidates(gray):
         pass
 
     # B) 허프 서클 (림이 더 뚜렷한 경우에 강함)
-    g = cv2.GaussianBlur(gray, (5, 5), 0) # 허프변환은 노이즈에 민감하므로, 먼저 가우시안 블러로 노이즈를 부드럽게 만들어서 안정적인 원 검출을 유도. (5,5) 커널, sigmaX=0은 OpenCV가 적당한 σ를 자동 계산.
-    circles = cv2.HoughCircles(
-        g, cv2.HOUGH_GRADIENT, dp=1.2, minDist=min(h, w)//4, # g: 입력 이미지(블러된 그레이스케일). cv2.HOUGH_GRADIENT: 일반적인 그래디언트 기반 허프 원 검출 방식. dp=1.2: accumulator 해상도. 약간 줄어든 해상도로 연산해서 속도/안정성 트레이드오프. minDist=min(h, w)//4: 검출된 원들끼리 최소 거리. 한 이미지에 원(휠)이 여러 개 있어도 너무 가까이 겹쳐 있지 않게, 중복 검출을 줄이려는 튜닝값.
-        param1=120, param2=40, minRadius=40, maxRadius=0 # param1=120, param2=40: 내부적으로 Canny 엣지 또는 허프 누산기 threshold로 사용됨. 120는 Canny 상한 threshold. 40는 원으로 인정할 허프 accumulator threshold. minRadius=40: 반지름 최소값 40픽셀 → 너무 작은 동그라미(노이즈) 무시. maxRadius=0: 상한 없음이니 자동으로 설정.
-    )
-    if circles is not None: # HoughCircles가 원을 하나 이상 찾았을 때만 루프.
-        for c in circles[0, :]:
-            cx, cy, r = int(c[0]), int(c[1]), int(c[2]) # 각각 원 중심과 반지름을 정수로 변환.
-            r = int(r * CROP_PAD) # 마찬가지로 여유를 주기 위해 pad 배수(CROP_PAD) 곱함. 타이어 전체 영역을 포함하게 반지름을 키우는 효과.
-            x1, y1 = max(0, cx - r), max(0, cy - r) # 원 중심+-반지름으로 사각형 박스 만듬. max(0, ...), min(w/h, ...)로 이미지 범위 제한.
-            x2, y2 = min(w, cx + r), min(h, cy + r)
-            if (x2 - x1) > 30 and (y2 - y1) > 30: # 크기가 30×30보다 작은 후보는 버린다 (노이즈 후보 제거).
-                boxes.append([x1, y1, x2, y2]) # 허프 서클 기반 후보 박스 추가.
-                roi = gray[y1:y2, x1:x2] # 해당 후보 영역을 잘라서 ROI로 사용.
-                edges = cv2.Canny(roi, 80, 160) # Canny 엣지 검출로, 이 영역에 선/엣지가 얼마나 많은지 확인. 휠/타이어 부분은 보통 스포크, 패턴 때문에 엣지(경계선/패턴)가 풍부하다고 가정. 엣지가 많은 후보 박스 -> “휠/타이어일 확률이 좀 더 높다”
-                scores.append(float(edges.mean()) / 255.0) #  엣지 영상의 평균 밝기를 계산한다. 이는 0~255 사이인데 나누기 255.0으로 0~1 사이로 정규화. 엣지 많을수록 평균이 높아지므로, 엣지가 많은 후보일수록 scores 높게 설정.
+    g = cv2.GaussianBlur(gray, (5, 5), 0)
+    h, w = gray.shape
+    m = min(h, w)
+
+    # gate에서 원을 이미 찾았으면 여기서 HoughCircles 스킵
+    if gate_circle is not None:
+        cx, cy, r = gate_circle
+        cx, cy, r = int(cx), int(cy), int(r)
+
+        r = int(r * CROP_PAD)
+        x1, y1 = max(0, cx - r), max(0, cy - r)
+        x2, y2 = min(w, cx + r), min(h, cy + r)
+
+        if (x2 - x1) > 30 and (y2 - y1) > 30:
+            boxes.append([x1, y1, x2, y2])
+            roi = gray[y1:y2, x1:x2]
+            edges = cv2.Canny(roi, 80, 160)
+            scores.append(float(edges.mean()) / 255.0)
+
+    else:
+        # gate_circle이 없을 때만 HoughCircles 수행
+        minR = max(40, int(m * 0.07))  # 800x600이면 약 42
+        maxR = int(m * 0.45)  # 800x600이면 270
+
+        circles = cv2.HoughCircles(
+            g, cv2.HOUGH_GRADIENT,
+            dp=1.2, minDist=m // 4,
+            param1=120, param2=40,
+            minRadius=minR, maxRadius=maxR
+        )
+
+        if circles is not None:
+            for c in circles[0, :]:
+                cx, cy, r = int(c[0]), int(c[1]), int(c[2])
+                r = int(r * CROP_PAD)
+                x1, y1 = max(0, cx - r), max(0, cy - r)
+                x2, y2 = min(w, cx + r), min(h, cy + r)
+                if (x2 - x1) > 30 and (y2 - y1) > 30:
+                    boxes.append([x1, y1, x2, y2])
+                    roi = gray[y1:y2, x1:x2]
+                    edges = cv2.Canny(roi, 80, 160)
+                    scores.append(float(edges.mean()) / 255.0)
 
     # C) 후보가 하나도 없으면 중앙 크롭 폴백(최후의 최후), 최악의 상황(타원도, 원도 못 찾는 경우)에도 RCNN이 어딘가에서는 타이어를 찾아낼 기회를 주자는 취지.
     if not boxes:
@@ -404,35 +475,35 @@ def analyze_car_image(car_image_path: str) -> dict:
     img_n = clahe.apply(img) # CLAHE 적용된 정규화 이미지. 이후 모든 후보 탐색/RCNN 언랩은 이 img_n 기준으로 진행된다.
 
     # 1) 트레드 사진 판단, 맞으면 트레드 마모도 분석 모델로 전송
-    if is_tread_only_image(img_n):  # 타원/원이 없는 트레드만 있는 이미지인지 확인
-        print("[INFO] 트레드만 있는 이미지로 판단, 바로 분류 모델로 전송")  # 로그 출력
+    gate, gate_circle = is_tread_only_image(img_n, debug=False, return_circle=True)
+    print(f"[BRANCH] gate={gate} -> {'DIRECT' if gate else 'DETECT_PIPELINE'}")
 
-        # 트레드 이미지 저장
-        tread_path = os.path.join(out_dir, "tread_direct.png")  # 저장 경로 설정
-        cv2.imwrite(tread_path, img_n)  # CLAHE 적용된 이미지 저장
+    # 1) 트레드 사진 판단, 맞으면 트레드 마모도 분석 모델로 전송
+    if gate:
+        print("[INFO] 트레드만 있는 이미지로 판단, 바로 분류 모델로 전송")
 
-        # 바로 분류 모델 호출 (언랩 과정 생략)
-        status, prob, cam_path = classify_tread_image(  # 팀원의 분류 모델 호출
-            tread_path,  # 트레드 이미지 경로
-            model_path=os.path.join(script_dir, "models"),  # 모델 폴더 경로
-            model_name="model_best_weights.pth",  # 모델 가중치 파일명
-            img_size=224,  # 입력 이미지 크기
-            result_path=os.path.join(script_dir, "saved", "cam_result"),  # CAM 결과 저장 경로
-            temp_image_dir=os.path.join(script_dir, "temp_image"),  # 임시 이미지 폴더
-            temp_mask_dir=os.path.join(script_dir, "temp_mask"),  # 임시 마스크 폴더
+        tread_path = os.path.join(out_dir, "tread_direct.png")
+        cv2.imwrite(tread_path, img_n)
+
+        status, prob, cam_path = classify_tread_image(
+            tread_path,
+            model_path=os.path.join(script_dir, "models"),
+            model_name="model_best_weights.pth",
+            img_size=224,
+            result_path=os.path.join(script_dir, "saved", "cam_result"),
+            temp_image_dir=os.path.join(script_dir, "temp_image"),
+            temp_mask_dir=os.path.join(script_dir, "temp_mask"),
         )
 
-        # JSON 형태로 결과 반환
         return {
-            "result": {
-                "predict_result": status,  # 분류 결과 (danger/warning/safety)
-                "img_url": cam_path  # CAM 히트맵 이미지 경로
-            }
+            "result": {"predict_result": status, "img_url": cam_path}
         }
+
+    print("[INFO] 트레드만 있는 이미지가 아님: 타이어 후보 파이프라인으로")
 
     try:
         # 2) 타이어 후보 탐색
-        boxes, scores = find_candidates(img_n) # find_candidates() 사용
+        boxes, scores = find_candidates(img_n, gate_circle=gate_circle) # find_candidates() 사용
         print(f"[INFO] candidate boxes: {len(boxes)}") # 후보가 몇 개 나왔는지 콘솔에 Logging.
 
         # 3) RCNN 언랩
