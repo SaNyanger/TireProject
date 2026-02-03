@@ -9,7 +9,7 @@ from tire_classifier import classify_tread_image
 # =========================
 # 튜닝 파라미터 (숫자만 바꿔도 됨)
 # =========================
-IMG_NAME = "car6_withSnow.webp"      # 기본 입력 이미지 이름 (assets 폴더 기준)
+IMG_NAME = "car1.jpg"      # 기본 입력 이미지 이름 (assets 폴더 기준)
 
 MAX_SIDE = 1920            # 긴 변 리사이즈 상한 이보다 크면 축소 (None이면 원본 유지)
 MIN_SIDE = 800             # 긴 변 리사이즈 하한 이보다 작으면 확대 (None이면 원본 유지)
@@ -173,29 +173,62 @@ def find_candidates(gray, gate_circle=None):
         pass
 
     # B) 허프 서클 (림이 더 뚜렷한 경우에 강함)
-    g = cv2.GaussianBlur(gray, (5, 5), 0)
     h, w = gray.shape
     m = min(h, w)
+    g = cv2.GaussianBlur(gray, (5, 5), 0)
+
 
     # gate에서 원을 이미 찾았으면 여기서 HoughCircles 스킵
-    if gate_circle is not None:
+    # -> (수정) gate_circle이 있어도 "유효"할 때만 사용
+    use_gate = (gate_circle is not None)
+    cx = cy = r = None
+
+    if use_gate:
         cx, cy, r = gate_circle
         cx, cy, r = int(cx), int(cy), int(r)
 
-        r = int(r * CROP_PAD)
-        x1, y1 = max(0, cx - r), max(0, cy - r)
-        x2, y2 = min(w, cx + r), min(h, cy + r)
+        minR = max(40, int(m * 0.07))
+        maxR = int(m * 0.45)
+        if not (minR <= r <= maxR):
+            print(f"[DEBUG] gate_circle rejected by radius: r={r}, expected=[{minR},{maxR}]")
+            use_gate = False
 
-        if (x2 - x1) > 30 and (y2 - y1) > 30:
+    if use_gate:
+        # (기존) pad 적용해서 박스 만들기
+        pad = min(CROP_PAD, 1.25)
+        r2 = int(r * pad)
+
+        x1, y1 = max(0, cx - r2), max(0, cy - r2)
+        x2, y2 = min(w, cx + r2), min(h, cy + r2)
+
+        area = (x2 - x1) * (y2 - y1)
+        print(f"[DEBUG] gate_box: {(x1, y1, x2, y2)}, area_ratio={area / (w * h + 1e-6):.3f}")
+
+        # ---- [추가 2] 테두리에 너무 많이 붙으면 gate 무효 ----
+        touch = 0
+        if x1 <= 0: touch += 1
+        if y1 <= 0: touch += 1
+        if x2 >= w: touch += 1
+        if y2 >= h: touch += 1
+        if touch >= 2:
+            print(f"[DEBUG] gate_box rejected by border-touch: touch={touch}")
+            use_gate = False
+
+        # ---- [추가 3] area_ratio 기준도 좀 더 빡세게(선택) ----
+        if (area / (w * h + 1e-6)) > 0.75:
+            print("[DEBUG] gate_box rejected by area_ratio")
+            use_gate = False
+
+        if use_gate and (x2 - x1) > 30 and (y2 - y1) > 30:
             boxes.append([x1, y1, x2, y2])
             roi = gray[y1:y2, x1:x2]
             edges = cv2.Canny(roi, 80, 160)
             scores.append(float(edges.mean()) / 255.0)
 
-    else:
-        # gate_circle이 없을 때만 HoughCircles 수행
-        minR = max(40, int(m * 0.07))  # 800x600이면 약 42
-        maxR = int(m * 0.45)  # 800x600이면 270
+    # gate가 실패했거나 원래 gate_circle이 없으면 HoughCircles 수행
+    if not use_gate:
+        minR = max(40, int(m * 0.07))
+        maxR = int(m * 0.45)
 
         circles = cv2.HoughCircles(
             g, cv2.HOUGH_GRADIENT,
@@ -207,10 +240,19 @@ def find_candidates(gray, gate_circle=None):
         if circles is not None:
             for c in circles[0, :]:
                 cx, cy, r = int(c[0]), int(c[1]), int(c[2])
-                r = int(r * CROP_PAD)
-                x1, y1 = max(0, cx - r), max(0, cy - r)
-                x2, y2 = min(w, cx + r), min(h, cy + r)
+
+                pad = min(CROP_PAD, 1.35)
+                r2 = int(r * pad)
+
+                x1, y1 = max(0, cx - r2), max(0, cy - r2)
+                x2, y2 = min(w, cx + r2), min(h, cy + r2)
+
                 if (x2 - x1) > 30 and (y2 - y1) > 30:
+                    # (선택) 너무 큰 박스는 후보로 넣지 않기
+                    area = (x2 - x1) * (y2 - y1)
+                    if area / (w * h + 1e-6) > 0.90:
+                        continue
+
                     boxes.append([x1, y1, x2, y2])
                     roi = gray[y1:y2, x1:x2]
                     edges = cv2.Canny(roi, 80, 160)
@@ -225,13 +267,36 @@ def find_candidates(gray, gate_circle=None):
         boxes = [[x1, y1, x1 + nw, y1 + nh]] # 중앙 박스 하나만 후보로 강제 생성.
         scores = [0.0] # 뒤에서 full_box에 1.0을 줄 거라 상대적으로 낮게 설정
 
-    # 풀프레임도 후보에 추가. 어떤 기법도 제대로 후보를 못 잡았다고 하더라도, 이미지 전체를 넣고 RCNN이 알아서 찾도록 하는 fallback을 항상 확보.
-    full_box = [0, 0, w, h] # 이미지 전체 영역.
-    boxes = [full_box] + boxes # 맨 앞에 풀프레임을 추가.
-    scores = [1.0] + scores # 풀프레임의 스코어를 1.0으로 둔다. 앞에서 타원/허프 후보에 준 점수들이 0~1 사이였으니 풀프레임이 꽤 높은 점수를 가지도록 했다.
+    print(f"[DEBUG] pre-nms boxes: {len(boxes)}")
+    for b, s in zip(boxes, scores):
+        tag = "FULL" if b == [0, 0, w, h] else ""
+        print("  ", b, f"score={s:.3f}", tag)
 
-    # NMS로 중복 제거, 앞에서 타원, 허프 서클, 중앙 fallback 으로 생성 된거 상당수는 서로 많이 겹치는 박스일 수 있기 때문에 nms사용, IOU 0.4 이상 겹치는 박스들 중에서는 가장 점수 높은 것만 남기고 제거.
+    # 후보들끼리만 NMS
     boxes, scores = nms(boxes, scores, thr=0.4)
+    print(f"[DEBUG] post-nms boxes: {len(boxes)}")
+    for b, s in zip(boxes, scores):
+        print("  ", b, f"score={s:.3f}")
+
+    # 보험용 full_box는 NMS 밖에서 따로 추가 (맨 뒤)
+    full_box = [0, 0, w, h]
+    boxes.append(full_box)
+    scores.append(1.0)  # 점수는 의미 거의 없음(그냥 기록용)
+
+    #dedupe 하는 코드
+    uniq = {}
+    for b, s in zip(boxes, scores):
+        tb = tuple(b)
+        if tb not in uniq or s > uniq[tb]:
+            uniq[tb] = s
+
+    boxes = [list(tb) for tb in uniq.keys()]
+    scores = [uniq[tuple(b)] for b in boxes]
+
+    # 점수 순서 정렬
+    pairs = sorted(zip(boxes, scores), key=lambda x: x[1], reverse=True)
+    boxes, scores = [p[0] for p in pairs], [p[1] for p in pairs]
+
     return boxes, scores
 
 # =========================
@@ -477,6 +542,12 @@ def analyze_car_image(car_image_path: str) -> dict:
     # 1) 트레드 사진 판단, 맞으면 트레드 마모도 분석 모델로 전송
     gate, gate_circle = is_tread_only_image(img_n, debug=False, return_circle=True)
     print(f"[BRANCH] gate={gate} -> {'DIRECT' if gate else 'DETECT_PIPELINE'}")
+    if gate_circle is not None:
+        cx, cy, r = gate_circle
+        H, W = img_n.shape[:2]
+        print(f"[DEBUG] gate_circle: cx={cx:.1f}, cy={cy:.1f}, r={r:.1f}, img_w={W}, img_h={H}")
+    else:
+        print("[DEBUG] gate_circle: None")
 
     # 1) 트레드 사진 판단, 맞으면 트레드 마모도 분석 모델로 전송
     if gate:
@@ -505,6 +576,22 @@ def analyze_car_image(car_image_path: str) -> dict:
         # 2) 타이어 후보 탐색
         boxes, scores = find_candidates(img_n, gate_circle=gate_circle) # find_candidates() 사용
         print(f"[INFO] candidate boxes: {len(boxes)}") # 후보가 몇 개 나왔는지 콘솔에 Logging.
+
+        # --- Debug: 후보 박스 시각화 (find_candidates 결과) ---
+        dbg_fc = cv2.cvtColor(img_n, cv2.COLOR_GRAY2BGR)
+        H, W = img_n.shape[:2]
+        print("[DEBUG] boxes from find_candidates:")
+        for b, s in zip(boxes, scores):
+            tag = "FULL" if b == [0, 0, W, H] else ""
+            print(f"  {b} score={s:.3f} {tag}")
+
+        for (x1, y1, x2, y2) in boxes:
+            is_full = (x1 == 0 and y1 == 0 and x2 == W and y2 == H)
+            if is_full:
+                continue  # full_box는 후보 디버그에서 제외
+            cv2.rectangle(dbg_fc, (x1, y1), (x2, y2), (0, 255, 0), 2)
+
+        cv2.imwrite(os.path.join(out_dir, "debug_find_candidates.jpg"), dbg_fc)
 
         # 3) RCNN 언랩
         best, all_results = run_rcnn_on_crops( # run_rcnn_on_crops() 사용
